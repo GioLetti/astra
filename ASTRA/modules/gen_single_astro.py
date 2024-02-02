@@ -5,8 +5,26 @@ from skimage import io
 import h5py
 from joblib import Parallel, delayed
 import torch 
+from typing import Any, Dict, Union, Callable
+import os
 
-def create_bb_coord(soma_mask,BB_dim):
+def create_bb_coord(soma_mask:np.array,
+                    BB_dim:int):
+    '''
+    The function identifies countors starting from the soma binary mask. 
+    For each, a bounding box of dimension BB_dim surrouding them is calculated and a 
+    circle of r = BB_dim/2 centered at soma center position is drawn.
+
+    Input:
+        - soma_mask: soma binary mask
+        - BB_dim: bounding box dimension
+
+    Output:
+        - coord_list: list where each element is a list of BB coordinates [c1x,c1y,c2x,c2y]
+        - filt_im_zone: [N,M,n] where n is the number of soma identified. [:,:,x] is a binary map of a circle (r = BB_dim//2) surrounding the soma, inscribed in the correspective BB
+
+    '''
+
     #use even BB_dim
     ################################################
     #    0------------------------>x
@@ -44,19 +62,22 @@ def create_bb_coord(soma_mask,BB_dim):
             cX = int(Mom["m10"] / Mom["m00"])
             cY = int(Mom["m01"] / Mom["m00"])
             #print(cX,cY)
-            cv2.circle(filt_,(cX,cY),43,255,thickness = -1,lineType=8)
+            cv2.circle(filt_,(cX,cY),43,255,thickness = -1,lineType=8) #! Check I think 43 should be changed with BBh
             filt_im_zone[:,:,cnt]=filt_
             cnt+=1
 
             casex=2
             casey=2
-            if cX-BBh<0:
+
+            #the following lines address when the circle is at the FOV's borders
+
+            if cX-BBh<0: # outised left border
                 casex=0
-            elif cX+BBh>M:
+            elif cX+BBh>M: # outside right border
                 casex=1
-            if cY-BBh<0:
+            if cY-BBh<0: # outside upper border
                 casey=0
-            elif cY+BBh>N:
+            elif cY+BBh>N: # outside bottom border
                 casey=1
             #x
             if casex==2:
@@ -229,7 +250,17 @@ def save_im_l(im,stack,mask_soma,save_folder,item,BB_dim,th1_p,th2_p,pad=5):
 
 ################################################# SPATIAL PP
 class spatial_pp():
-    def __init__(self,file_path):
+    '''
+    Class containing functions necessary for the computation of the spatial maps.
+
+    Input:
+        - path to the desired T-series
+    '''
+
+
+    def __init__(self,
+                 file_path:os.path = None # path to the T-serie
+                 ):
         if type(file_path) is np.ndarray:
             print('file already loaded')
             self.stack = file_path
@@ -237,9 +268,21 @@ class spatial_pp():
             print('file loading...')
             self.stack = io.imread(file_path)
         
-    def create_img(self,T_st=0):
+    def create_img(self,
+                   T_st: int =0):
+        '''
+        The function performs spatial sharpening (described at line 730 of pre-print)
 
-        _,N,M = self.stack.shape
+        It uses the clipping limited adaptive histogram equalization (CLAHE) from openCV.
+        Check here for better explanation: https://docs.opencv.org/3.4/d5/daf/tutorial_py_histogram_equalization.html
+
+        Output:
+            - stack_new: T-series with 10th percentile intenisty subtracted at each frame
+            - image: Median projection normalized, rescaled at 16 bit, equalized and convolved with sharpening kernel
+        
+        '''
+
+        _,N,M = self.stack.shape # FOV dimensions
         if T_st==0:
             self.stack = self.stack.astype(np.float32)
         else:
@@ -249,15 +292,15 @@ class spatial_pp():
 
         T,N,M = stack_new.shape
         for t in range(T):
-            stack_new[t,:,:] = stack_new[t,:,:] - np.percentile(stack_new[t,:,:],10)
+            stack_new[t,:,:] = stack_new[t,:,:] - np.percentile(stack_new[t,:,:],10) # correct the stack removing the 10th percentile intensity at each frame 
             stack_new[t,:,:][stack_new[t,:,:]<0]=0 
 
-        conv_im = np.median(stack_new,axis=0)  
-        maximum = 65535/np.amax(conv_im) 
-        conv_im =conv_im.astype(np.float32)*maximum   
+        conv_im = np.median(stack_new,axis=0) # median projection (across frames)
+        maximum = 65535/np.amax(conv_im) # considering 16-bit intenisty 65535 is the maximum value
+        conv_im =conv_im.astype(np.float32)*maximum  # max normalization and rescaled at 16 bit
 
 
-        clahe = cv2.createCLAHE(clipLimit=0.5, tileGridSize=(8,8))
+        clahe = cv2.createCLAHE(clipLimit=0.5, tileGridSize=(8,8)) # CLAHE
         cl1 = clahe.apply(np.uint16(conv_im))       
 
 
@@ -479,6 +522,12 @@ class filt_im(spatial_pp):
 
     
     def filtering(self,stack,th1_p=0.25,th2_p=0.1):
+        '''
+        Threshold filtering as described at line 785 in pre-print
+
+        Output:
+            - sum_p: binary map (1 foreground, 0 background)
+        '''
         
         T,N,M = stack.shape
         
@@ -495,7 +544,7 @@ class filt_im(spatial_pp):
         stack_cp[stack>=percent]=1
 
         sum_= np.sum(stack_cp,axis=0)
-        th1 = round(T*th1_p)
+        th1 = round(T*th1_p) # threshold expressed as frame number
         sum_[sum_<th1]=0
         sum_[sum_>=th1]=1
 
@@ -604,7 +653,7 @@ class filt_im(spatial_pp):
     @staticmethod
     def gen_single_im(crop_stack,crop_im,i,pad,th1_p=0.25,th2_p=0.1):
         
-        def filtering(stack,th1_p=0.25,th2_p=0.1):
+        def filtering(stack,th1_p=0.25,th2_p=0.1): 
             T,N,M = stack.shape
 
 
@@ -639,10 +688,11 @@ class filt_im(spatial_pp):
         crop_mask_filt = filtering(crop_stack,th1_p,th2_p)
 
         
-        out_stack =np.empty((2,N+2*pad,M+2*pad),dtype=np.float32)
+        out_stack =np.empty((2,N+2*pad,M+2*pad),dtype=np.float32) #! pad can be removed
 
-        out_stack[0,:,:] = np.pad(crop_im*crop_mask_filt,pad,'constant').astype(np.float32)
-        out_stack[0,:,:] -= np.mean(out_stack[0,:,:])
+        #! I'm not convinced
+        out_stack[0,:,:] = np.pad(crop_im*crop_mask_filt,pad,'constant').astype(np.float32) #! This line can be removed
+        out_stack[0,:,:] -= np.mean(out_stack[0,:,:]) #! This line can be removed
         out_stack[1,:,:] = np.pad(crop_mask_filt,pad,'constant').astype(np.float32)
         
         return [out_stack,i]
@@ -686,16 +736,35 @@ class filt_im(spatial_pp):
     
     
 class tune_th(filt_im):
+
+    '''
+    The class is part of the local activity filtering module (see line 785 pre-print).
+    It is used to identify the correct hyperparameter (thresholds alpha_1 and alpha_2).
+    '''
     
-    def __init__(self, stack,mask,BB_dim,filt_meth='std'):
+    def __init__(self,
+                stack:np.array, # T-series
+                 mask:np.array, # np array [N,M,2], where [:,:,0] binary mask of processes, while [:,:,1] binary mask of somas
+                 BB_dim:int, # bounding box dimension
+                 filt_meth:str='std'):
         self.BB_dim = BB_dim   
         self.stack = stack
         self.mask = mask
-        self.coord_list,self.filt_im_zone = create_bb_coord(mask[:,:,1],BB_dim)
+        self.coord_list,self.filt_im_zone = create_bb_coord(mask[:,:,1],BB_dim) # generates bounding box and calculates the coordinates
         self.filt_meth = filt_meth
         assert self.filt_meth =='std' or self.filt_meth =='std_par' or self.filt_meth=='ad_hoc','Undefined local activity filter'
     
     def save_im(self):
+        '''
+        The function computes thresholds optimization (alpha_1 - alpha_2) for the local filtering module.
+        For each couple (alpha_1,alpha_2) an error indicating how much consensus pixels for
+        both soma and processes have being removed is calculated (wrong pixels number/total pixel number)*100
+
+        Output:
+            - TP_err = list of [soma_error,process_error] for each couple (alpha_1,alpha_2)
+        
+        '''
+
         dim = self.BB_dim
         T,N,M = self.stack.shape
         
@@ -714,17 +783,17 @@ class tune_th(filt_im):
           
                         stack_to_crop = self.stack.copy()
                         crop_stack = stack_to_crop[:,coord[1]:coord[3],coord[0]:coord[2]]        
-                        crop_mask_filt = self.filtering(crop_stack,th1_p,th2_p)
+                        crop_mask_filt = self.filtering(crop_stack,th1_p,th2_p) # binary map from the local activity filtering
                         act_filt[coord[1]:coord[3],coord[0]:coord[2]] += crop_mask_filt
                     ##### to par
                     act_filt[act_filt>1]=1
-                    soma_err = 100*np.sum(self.mask[:,:,1]-self.mask[:,:,1]*act_filt)/np.sum(self.mask[:,:,1])
-                    proc_err = 100*np.sum(self.mask[:,:,0]-self.mask[:,:,0]*act_filt)/np.sum(self.mask[:,:,0])
+                    soma_err = 100*np.sum(self.mask[:,:,1]-self.mask[:,:,1]*act_filt)/np.sum(self.mask[:,:,1]) # error for soma 
+                    proc_err = 100*np.sum(self.mask[:,:,0]-self.mask[:,:,0]*act_filt)/np.sum(self.mask[:,:,0]) # error for process 
                     TP_err.append(np.asarray([soma_err,proc_err]))
         
         elif self.filt_meth == 'std_par':
             self.im_enh = np.ones((N,M))
-            pad=0 
+            pad=0 #! THIS CAN BE REMOVED
             out_dim = self.BB_dim + 2*pad
             for th1_p,th2_p in zip([0.3,0.25,0.20,0.15],[0.15,0.1,0.07,0.05]):
                 print('THRESH',th1_p,th2_p)
@@ -736,7 +805,7 @@ class tune_th(filt_im):
                 ###
                 for res in list_out:
                     idx = res[1]
-                    act_filt[self.coord_list[idx][1]:self.coord_list[idx][3],self.coord_list[idx][0]:self.coord_list[idx][2]] += res[0][1,pad:out_dim-pad,pad:out_dim-pad]
+                    act_filt[self.coord_list[idx][1]:self.coord_list[idx][3],self.coord_list[idx][0]:self.coord_list[idx][2]] += res[0][1,pad:out_dim-pad,pad:out_dim-pad] #! pad remove even here
 
                 act_filt[act_filt>1]=1
                 soma_err = 100*np.sum(self.mask[:,:,1]-self.mask[:,:,1]*act_filt)/np.sum(self.mask[:,:,1])

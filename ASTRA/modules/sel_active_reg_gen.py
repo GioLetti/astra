@@ -11,24 +11,36 @@ import h5py
 from numba import cuda,float32,uint16,float64,int64,int32
 import time
 from math import floor
-
+from typing import Any, Dict, Union, Callable
 import torch
+
 
 class ThScal():
     def __init__(self,stack):
         kernel = np.ones((50,50),np.float32)/(50*50)
-        density = cv2.filter2D(np.mean(stack,axis=0),-1,kernel)
-        self.density = density/np.amax(density)
+        density = cv2.filter2D(np.mean(stack,axis=0),-1,kernel) #smoothed mean projection
+        self.density = density/np.amax(density) 
         
-    def ThMat(self,ff,th_):
+    def ThMat(self,ff:np.array,th_:np.array):
+        '''
+        The threshold matrix is corrected taking into consideration the pixel activity. 
+        In particular for less active pixel the time threshold (number of frames) necessary to be considered active get reduced more.
+
+        Input:
+            - ff: np array [N,M] where each entry represent the number of frame in which the pixel was active
+            - th_: time threshold expressed in frames number
+
+        Output:
+            - ff: binary np array [N,M] with 1 - active pixels, 0 - inactive pixels
+        '''
         N,M = ff.shape
         mask_th = th_*np.ones((N,M))
         
         cnt=1
         for i in [0.6,0.4,0.2,0]:
             buff = self.density.copy()
-            buff[buff<i]=0
-            buff[buff>=i+0.2]=0
+            buff[buff<i]=0 # remove pixel active less than 0.6
+            buff[buff>=i+0.2]=0 # remove too active pixel #! but why + 0.2 ? 
             buff[buff>0]=1
             mask_th-=buff*(th_*0.05*cnt)
             cnt+=1
@@ -96,6 +108,10 @@ def sel_active_gpu_gen(bz,time_ref,per_mat,stack,im_out,cover,BPM_ratio,stp,iter
     
     
 class sel_active_reg():
+
+    '''
+    Class composing the activity map generation module (described at line 742 of pre-print)
+    '''
     
     def __init__(self,stack,dict_params,verbose=True,static=False,jobs=-1):
         self.stack = stack
@@ -109,13 +125,13 @@ class sel_active_reg():
         self.BPM_ratio = dict_params['BPM_ratio'] # # of block inside a patch
         self.bb = dict_params['bb']
 
-        self.N_pix_st = dict_params['N_pix_st']
-        self.astr_min = dict_params['astr_min']
+        self.N_pix_st = dict_params['N_pix_st'] # starting somata area (expressed in pixel)
+        self.astr_min = dict_params['astr_min'] # minimum area to consider an astrocyte (expressed in pixel)
         self.per_tile = dict_params['percentile']
         self.astro_num = dict_params['astro_num']
-        self.init_th_ = dict_params['init_th_']
-        self.decr_dim = dict_params['decr_dim']
-        self.decr_th = dict_params['decr_th']
+        self.init_th_ = dict_params['init_th_'] #initial time threshold 
+        self.decr_dim = dict_params['decr_dim'] # decrease in somata area (expressed in pixel - from paper should be 10%)
+        self.decr_th = dict_params['decr_th'] # time threshold deecrease (from paper should be 3%)
         self.corr_int = dict_params['corr_int']
         self.gpu_flag = dict_params['gpu_flag']
         self.jobs = jobs
@@ -171,10 +187,24 @@ class sel_active_reg():
             return im_out,cover
     
     @staticmethod
-    def percent_matrix_par(stack,t,listx,bb,per_tile):
+    def percent_matrix_par(stack:np.array,
+                           t:int, # frame number
+                           listx:list, #step list for patch generation (dict_params['list']). Those defines the position of each patch
+                           bb:int, #bounding box dimensions (bb + last entry of list x = FOV dimension)
+                           per_tile:Union[int,float] # percentile of voxels intensity distribution used as threshold (dict_params['percentile'])
+                           ):
+        '''
+        Function calculates the percentile matrix, where each entry is the percentile (per_tile) for a specific patch.
+        Each 
+        
+        Output:
+            - matrix: percentile matrix
+        '''
+
+
         listy = listx
         dim = len(listx)
-        matrix= t*np.ones((dim+1,dim),dtype=np.float32)
+        matrix= t*np.ones((dim+1,dim),dtype=np.float32) #! why the t? it's useless and why the +1?
 
         for i in range(dim):
             for j in range(dim):
@@ -217,7 +247,7 @@ class sel_active_reg():
 
         percent_list = Parallel(n_jobs=self.jobs,verbose=1)(delayed(self.percent_matrix_par)(self.stack,i,self.step_list,self.bb,self.per_tile) for i in range(T))
         percentiles = np.asarray(percent_list)
-        mat_per = percentiles[:,:-1,:]
+        mat_per = percentiles[:,:-1,:] #! why :-1 ?
         mat_per = mat_per[percentiles[:,-1,0].astype(np.int32),:,:]
 
         im_out = np.empty((T,N,M)) 
@@ -226,7 +256,7 @@ class sel_active_reg():
             for x in self.step_list:
                 for y in self.step_list:
 
-                    buffer_im = self.stack[i,x:x+self.bb,y:y+self.bb]-mat_per[i,x//self.stp,y//self.stp]
+                    buffer_im = self.stack[i,x:x+self.bb,y:y+self.bb]-mat_per[i,x//self.stp,y//self.stp] # for each patch the corresponding percentile is subtracted
                     buffer_im[buffer_im<0]=0.
                     buffer_im[buffer_im>0]=1.
 
@@ -357,7 +387,13 @@ class sel_active_reg():
         else:
             pass
     
-    def get_mask(self,find_round=True,long_rec=False):
+    def get_mask(self,
+                 find_round:bool=True, #! if find_round is set to False, this will cause an error as variable ratio is not defined in this case
+                 long_rec:bool=False):
+        '''
+        The function performs selection of active regions
+        
+        '''
         T,_,_ = self.stack.shape
         
         if self.gpu_flag and not(long_rec):
@@ -372,12 +408,12 @@ class sel_active_reg():
         else:
             self.sel_active_reg_cpu()
     
-        if self.corr_int:
+        if self.corr_int: #intensity correction
             
             scaling = ThScal(self.stack)
 
        
-        th_ =round(T*self.init_th_)
+        th_ =round(T*self.init_th_) #time threshold in frame number
         
         if find_round:
             #this is an alternative strategy to select the strating point threshold the nearest to th_, it is a seed for the while below 
@@ -397,16 +433,20 @@ class sel_active_reg():
         flag_th=True
         N_pix = self.N_pix_st
         
+        # the while continues until the number of active zones > estimated astrocyte number and
+        # the astro area is gretaer than 30% of the minimal area and
+        # the time threshold is greater than 30% of the total frames number
+
         while(cnt<self.astro_num and N_pix>=self.N_pix_st*0.3 and th_>round(T*0.3)):
             if flag_th:
-                mask_tot_s = self.mask_tot.copy()#np.sum(self.mask_tot,axis=0)
+                mask_tot_s = self.mask_tot.copy()#np.sum(self.mask_tot,axis=0) 
 
                 if self.corr_int:
                     mask_tot_s = scaling.ThMat(mask_tot_s,th_)
                     mask_tot_s= np.uint8(mask_tot_s)
                 else:
                     mask_tot_s[mask_tot_s<=th_]=0
-                    mask_tot_s[mask_tot_s>0.5]=255
+                    mask_tot_s[mask_tot_s>0.5]=255 #! 0.5 should be sostituted with th_
                     mask_tot_s= np.uint8(mask_tot_s)  
 
 
@@ -417,7 +457,7 @@ class sel_active_reg():
             labels = labels_r.copy()
             cnt=0
             for i in range(1, ret):
-                pts =  np.where(labels == i)    
+                pts =  np.where(labels == i) # cluster area expressed in pixel 
                 #print(len(pts[0]))
                 if len(pts[0]) < N_pix:
                     
@@ -427,8 +467,13 @@ class sel_active_reg():
 
                     labels[pts] = 255         
             print('Found iter',cnt)
-            N_pix-=self.decr_dim
-            if N_pix<=self.astr_min and (starting_th-th_)<(ratio*105):
+            N_pix-=self.decr_dim # decreasing the soma area threshold 
+            
+            if N_pix<=self.astr_min and (starting_th-th_)<(ratio*105): #! why 105? 
+
+                # if not enough active zone are found with the starting temporal threshold th_ (even by reducing the soma area threshold)
+                # the temporal get reduced (should get reduced of 3% according to paper) and the soma area one get reinitialized to starting value 
+                # to start again the search
 
                 th_-=self.decr_th
                 flag_th = True  
