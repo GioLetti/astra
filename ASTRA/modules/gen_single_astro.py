@@ -338,8 +338,9 @@ class spatial_pp():
     
     def create_img_large(self):
 
-        self.stack = self.stack[:,2:-3,2:-3]
+        #self.stack = self.stack[:,2:-3,2:-3] before
 
+        
         T,N,M = self.stack.shape
         self.stack = self.stack.astype(np.float32)
         
