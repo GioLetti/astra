@@ -57,7 +57,7 @@ class Motion_Correction():
         T,cols,rows = im_stream2.shape
         for i in range(T):
             
-            M = np.float32([[1,0,self.X_shift[i,1]],[0,1,self.Y_shift[i,0]]])
+            M = np.float32([[1,0,self.X_shift[1,i]],[0,1,self.Y_shift[1,i]]])
             im_stream2[i,:,:] = cv2.warpAffine(im_stream2[i,:,:],M,(rows,cols))
         return im_stream2
     
